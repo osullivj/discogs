@@ -12,6 +12,8 @@ import urllib.parse
 import tornado.ioloop
 import tornado.web
 import tornado.httpclient
+from tornado.simple_httpclient import HTTPTimeoutError
+from tornado.httpclient import HTTPClientError
 
 import config
 
@@ -43,7 +45,7 @@ class Discogs(object):
         query_url = query_fmt % self.cfg
         await self.load_query_results(query_url)
 
-    def load_result_set(self, result_file_path):
+    def load_sub_cache(self, result_file_path):
         try:
             if os.path.exists(result_file_path):
                 with open(result_file_path, 'rt') as result_file:
@@ -55,7 +57,7 @@ class Discogs(object):
         return None
 
 
-    def save_result_set(self, cache_path):
+    def save_sub_cache(self, cache_path):
         persist_file_base = '_'.join(cache_path)
         persist_file_path = os.path.join(self.cfg['root_dir'], 'dat', f'{persist_file_base}.json')
         # open the file in write-only more so we overwrite contents
@@ -64,25 +66,41 @@ class Discogs(object):
             json.dump(cache_dict, persist_file)
 
 
+    def add_sub_cache(self, cache_path, sub_cache):
+        # the key within the payload should match the last element of result_cache_path
+        logging.info(f'add_sub_cache: {cache_path}')
+        object_count = 0
+        # payload should be a list...
+        if sub_cache:
+            # walk from root to leaf node in result cache
+            cache_dict = self.get_cache_dict(cache_path)
+            # the payload will be a list of dicts, each with an id, if
+            # this is a fresh query. But if loaded from file, the sub_cache
+            # will be a dict of dicts
+            if isinstance(sub_cache, dict):
+                cache_dict.update(sub_cache)
+                object_count = len(sub_cache)
+            elif isinstance(sub_cache, list):
+                for obj in sub_cache:
+                    oid = obj.get('id')
+                    if oid:
+                        cache_dict[oid] = obj
+                        object_count += 1
+                    else:
+                        logging.info(f'add_sub_cache: NOID {cache_path} {obj}')
+            else:
+                logging.error(f'add_sub_cache: TYPE {cache_path} {type(sub_cache)}')
+        else:
+            logging.error(f'add_sub_cache: EMPTY {cache_path}')
+        return object_count
+
+
     def add_result(self, cache_path, result):
         # the key within the payload should match the last element of result_cache_path
         logging.info(f'add_result: {cache_path}')
         payload_key = cache_path[-1]
         payload = result.get(payload_key)
-        object_count = 0
-        # payload should be a list...
-        if payload:
-            # walk from root to leaf node in result cache
-            cache_dict = self.get_cache_dict(cache_path)
-            # the payload will be a list of dicts, each with an id
-            for payload_dict in payload:
-                payload_id = payload_dict.get('id')
-                if not payload_id:
-                    logging.error(f'add_result: no id in {payload_dict}')
-                else:
-                    cache_dict[payload_id] = payload_dict
-                    object_count += 1
-        return object_count
+        return self.add_sub_cache( cache_path, payload)
 
 
     async def load_query_results(self, query_url):
@@ -93,10 +111,10 @@ class Discogs(object):
         result_file_path = os.path.join(self.cfg['root_dir'], 'dat', f'{result_file_base}.json')
         result_cache_path = result_file_base.split('_')
         logging.info(f'dispatch_query: QUERY:{query_url} {result_file_path}')
-        fs_cached_result = self.load_result_set(result_file_path)
+        fs_sub_cache = self.load_sub_cache(result_file_path)
         oc = 0
-        if fs_cached_result:
-            oc = self.add_result(result_cache_path, fs_cached_result)
+        if fs_sub_cache:
+            oc = self.add_sub_cache(result_cache_path, fs_sub_cache)
             logging.info(f'dispatch_query: LOAD:{result_file_path} {oc}')
             return oc
         oc = await self.dispatch_query(query_url, result_cache_path)
@@ -104,9 +122,10 @@ class Discogs(object):
     async def dispatch_query(self, query_url, cache_path):
         # first, the HTTP op...
         logging.info(f'dispatch_query: QUERY:{query_url} {cache_path}')
-        http_response = await self.http_client.fetch(query_url)
-        if http_response.code != 200:
-            logging.error(f'dispatch_query: {http_response.code} from {query_url}')
+        try:
+            http_response = await self.http_client.fetch(query_url)
+        except Exception as ex:
+            logging.error(f'dispatch_query: HTTP {query_url}\n{ex}')
             return 0
         result = json.loads(http_response.body)
         oc = self.add_result(cache_path, result)
@@ -119,9 +138,9 @@ class Discogs(object):
             if next_query:
                 self.io_loop.add_callback(self.dispatch_query, next_query, cache_path)
             else:   # no next query, ergo query complete, so let's persist
-                self.save_result_set(cache_path)
+                self.save_sub_cache(cache_path)
         else:   # not paginated, so let's save now...
-            self.save_result_set(cache_path)
+            self.save_sub_cache(cache_path)
         return oc
 
 
